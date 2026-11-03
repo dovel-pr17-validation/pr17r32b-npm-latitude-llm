@@ -1,0 +1,51 @@
+# Dependabot version updates.
+#
+# `cooldown` enforces a minimum-release-age (in days) before Dependabot will
+# open a PR for a fresh version — mirror of `.npmrc minimum-release-age` for
+# the bot-driven update path, and our primary supply-chain defense for pip
+# (uv has no native minimum-release-age flag).
+
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # Better Auth 1.7 needs a planned migration (MCP OAuth plugin removal,
+    # account.issuer backfill, SAML config semantics); stay on 1.6.x until then.
+    ignore:
+      - dependency-name: better-auth
+        versions: [">=1.7.0"]
+      - dependency-name: "@better-auth/*"
+        versions: [">=1.7.0"]
+
+  - package-ecosystem: pip
+    directories:
+      - /packages/telemetry/python
+      - /packages/platform/op-gepa/python
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    # packages/telemetry/python pins google-genai <2.9.0:
+    # openinference-instrumentation-google-genai imports
+    # google.genai._interactions, which google-genai removed in 2.9.0.
+    ignore:
+      - dependency-name: google-genai
+        versions: [">=2.9.0"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

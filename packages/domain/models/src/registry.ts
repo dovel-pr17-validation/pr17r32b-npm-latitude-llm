@@ -1,0 +1,399 @@
+/**
+ * Model registry: query, look up, and estimate costs for LLM models.
+ *
+ * Uses the bundled models.dev JSON as the data source. All operations
+ * are synchronous and require no network calls.
+ */
+
+import { formatCount, formatPrice } from "@repo/utils"
+import modelsDevJson from "./data/models.dev.json" with { type: "json" }
+import type { CostBreakdown, CostLookupResult, TokenUsage } from "./entities/cost.ts"
+import { computeCostBreakdown, estimateTotalCost } from "./entities/cost.ts"
+import type { Model, ModelPricing } from "./entities/model.ts"
+import { parseModelsDevData } from "./entities/model.ts"
+import { resolveProviderName } from "./provider-aliases.ts"
+
+let cachedModels: Model[] | null = null
+let cachedModelsByProvider: Map<string, readonly Model[]> | null = null
+
+/**
+ * Bedrock regional inference profiles prepend a geography prefix
+ * (`eu.`, `us.`, `apac.`) to the foundation model ID. Strip it
+ * so cost lookups match the base model ID in models.dev.
+ *
+ * @example "eu.amazon.nova-micro-v1:0" → "amazon.nova-micro-v1:0"
+ * @example "us.anthropic.claude-sonnet-4-6" → "anthropic.claude-sonnet-4-6"
+ */
+const BEDROCK_REGION_PREFIX_RE = /^(?:eu|us|apac)\./
+
+function stripBedrockRegionPrefix(modelId: string): string {
+  return modelId.replace(BEDROCK_REGION_PREFIX_RE, "")
+}
+
+/**
+ * Some Bedrock instrumentations report the bare foundation model id without the
+ * `<vendor>.` prefix that models.dev keys on (e.g. `claude-opus-4-8` instead of
+ * `anthropic.claude-opus-4-8`). Match on the `<vendor>.<modelId>` suffix,
+ * preferring the non-regional base entry whose pricing is canonical.
+ */
+function findBedrockModelByBareId(models: readonly Model[], modelId: string): Model | undefined {
+  const suffix = `.${modelId.toLowerCase()}`
+  let fallback: Model | undefined
+  for (const m of models) {
+    const id = m.id.toLowerCase()
+    if (!id.endsWith(suffix)) continue
+    fallback ??= m
+    if (!id.slice(0, -suffix.length).includes(".")) return m
+  }
+  return fallback
+}
+
+/**
+ * A provider whose catalog ids are `<vendor>/<model>` slugs may still be called with the bare model
+ * id, because that is what its own API accepts (OpenRouter's `grok-4.5` for `x-ai/grok-4.5`). Match
+ * on the `/<modelId>` suffix within that provider's own list, so the rate is the reported provider's
+ * own — this borrows nothing from another host.
+ *
+ * A single match is the whole condition. Two vendors shipping the same bare name are two different
+ * models at two different rates, and picking one would invent a number; those stay unpriced.
+ */
+function findModelByBareId(models: readonly Model[], modelId: string): Model | undefined {
+  if (modelId.includes("/")) return undefined
+
+  const suffix = `/${modelId.toLowerCase()}`
+  const matches = models.filter((m) => m.id.toLowerCase().endsWith(suffix))
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+/**
+ * Return the full list of bundled LLM models from models.dev.
+ *
+ * The result is cached after the first call.
+ */
+export function getAllModels(): Model[] {
+  if (!cachedModels) {
+    cachedModels = parseModelsDevData(modelsDevJson)
+  }
+  return cachedModels
+}
+
+/**
+ * Providers spell a version with a different separator than models.dev keys it. Claude Code reports
+ * `claude-opus-4.8`; the catalog keys the same model `claude-opus-4-8`. Canonicalise a version dot
+ * (a `.` sitting between two digits) to a `-` so the two spellings of one version collapse to a
+ * single form. The lookahead keeps consecutive separators (`4.8.1`) all converting. This only ever
+ * rewrites punctuation inside a version, never a letter or a word, so it cannot rename the model.
+ */
+const VERSION_DOT_RE = /(\d)\.(?=\d)/g
+
+function normalizeVersionPunctuation(id: string): string {
+  return id.replace(VERSION_DOT_RE, "$1-")
+}
+
+/**
+ * Find a model whose catalog key names the requested `modelId` outright: an exact match, or one that
+ * differs only in how a version is separated (`claude-opus-4.8` vs `claude-opus-4-8`).
+ *
+ * The punctuation match requires a single candidate: collapsing a dot must never pick between two
+ * genuinely different entries.
+ */
+function findModelExact(models: readonly Model[], modelId: string): Model | undefined {
+  const needle = modelId.toLowerCase()
+
+  const exact = models.find((m) => m.id.toLowerCase() === needle)
+  if (exact) return exact
+
+  const normalizedNeedle = normalizeVersionPunctuation(needle)
+  const punctuationMatches = models.filter((m) => normalizeVersionPunctuation(m.id.toLowerCase()) === normalizedNeedle)
+  return punctuationMatches.length === 1 ? punctuationMatches[0] : undefined
+}
+
+/**
+ * A prefix may absorb a snapshot date or a trailing qualifier, but never a version bump. `minimax-m2`
+ * offered for `minimax-m2.5` is a different, later model at its own rate, so answering with it reports
+ * a confident wrong price where no price is the honest result.
+ *
+ * Both separators `normalizeVersionPunctuation` treats as interchangeable spell a bump: `5.2` and `5-2`
+ * are the same version. A hyphen also introduces a snapshot (`gpt-4-0613`, `o1-2024-12-17`), so it
+ * counts only before a one- or two-digit component that ends there; a run followed by a letter is a
+ * size (`qwen3-30b`), not a version.
+ */
+const VERSION_BUMP_RE = /^\d(?:\.\d|-\d{1,2}(?![\da-z]))/
+
+function crossesVersionBoundary(needle: string, prefixLength: number): boolean {
+  return VERSION_BUMP_RE.test(needle.slice(prefixLength - 1))
+}
+
+/**
+ * A prefix ending between two digits cuts a number in half: `gpt-5-2` is not where `gpt-5-2025-04-14`
+ * ends, and `claude-fable-5-1` is not `claude-fable-5-12`.
+ */
+const SPLIT_NUMBER_RE = /^\d\d/
+
+function splitsNumber(needle: string, prefixLength: number): boolean {
+  return SPLIT_NUMBER_RE.test(needle.slice(prefixLength - 1))
+}
+
+/**
+ * Find the model whose ID is the longest prefix of the requested `modelId`, so a versioned name like
+ * `gpt-4.1-2025-04-14` still resolves to `gpt-4.1`.
+ *
+ * This is the loosest match in the registry and answers only once every exact one has declined. It
+ * stops at a `:` modifier (`:free`, `:thinking`, a context size), which selects a variant the catalog
+ * lists and prices separately; matching past one would answer with the unmodified model, and a free
+ * tier would come back at the paid rate.
+ *
+ * A prefix rejected for a version bump also rules out every shorter one: the requested id names a
+ * version the catalog does not list, and a shorter prefix is only further from it. `claude-fable-5-1.5`
+ * must not fall back to `claude-fable-5` once `claude-fable-5-1` has declined.
+ */
+function findModelByPrefix(models: readonly Model[], modelId: string): Model | undefined {
+  const needle = modelId.toLowerCase()
+
+  let best: Model | undefined
+  let bestLen = 0
+  let bumpedLen = 0
+
+  for (const m of models) {
+    const id = m.id.toLowerCase()
+    if (!needle.startsWith(id) || id.length <= bestLen) continue
+    if (needle[id.length] === ":" || splitsNumber(needle, id.length)) continue
+    if (crossesVersionBoundary(needle, id.length)) {
+      bumpedLen = Math.max(bumpedLen, id.length)
+      continue
+    }
+
+    best = m
+    bestLen = id.length
+  }
+
+  return bestLen > bumpedLen ? best : undefined
+}
+
+/**
+ * Find a model by ID (case-insensitive) with prefix fallback.
+ *
+ * First tries an exact match; then a version-punctuation match, so an id that differs from its
+ * catalog key only in how a version is separated (`claude-opus-4.8` vs `claude-opus-4-8`) still
+ * resolves; then falls back to the model whose ID is the longest prefix of the requested `modelId`.
+ * Useful for versioned model names like `gpt-4.1-2025-04-14` matching `gpt-4.1`.
+ */
+export function findModel(models: Model[], modelId: string): Model | undefined {
+  return findModelExact(models, modelId) ?? findModelByPrefix(models, modelId)
+}
+
+/**
+ * Get the pricing for a model, or null if unavailable.
+ *
+ * Presence is the only test: `hasValidCost` already requires both sides, and a rate of 0 is a real
+ * price. Rejecting a falsy one discarded every embedding model, which prices input and nothing else.
+ */
+export function getModelPricing(model: Model): ModelPricing | null {
+  return model.pricing ?? null
+}
+
+/**
+ * Get all models for a specific provider.
+ *
+ * Provider name matching is case-insensitive. Well-known aliases
+ * (e.g. `amazon_bedrock` -> `bedrock`) are resolved automatically.
+ */
+export function getModelsForProvider(provider: string): Model[] {
+  return [...modelsForResolvedProvider(resolveProviderName(provider))]
+}
+
+function modelsForResolvedProvider(name: string): readonly Model[] {
+  if (!cachedModelsByProvider) {
+    const byProvider = new Map<string, Model[]>()
+    for (const m of getAllModels()) {
+      const key = m.provider.toLowerCase()
+      const list = byProvider.get(key)
+      if (list) list.push(m)
+      else byProvider.set(key, [m])
+    }
+    cachedModelsByProvider = byProvider
+  }
+  return cachedModelsByProvider.get(name) ?? []
+}
+
+/**
+ * Price a `<vendor>/<model>` slug from the vendor named in it, for the two cases where the vendor is
+ * the better authority than the provider reported alongside it.
+ *
+ * The vendor may answer when it *is* the reported provider, which makes the prefix a duplicated
+ * namespace rather than routing information; or when the reported provider is a label the catalog has
+ * never heard of, leaving the slug as the only thing to go on. A provider the catalog *does* know,
+ * which simply does not list this model, is a different story: it is a real host serving something we
+ * have no price for, and its rate is its own, not the vendor's. That stays unpriced.
+ *
+ * The match is exact, deliberately not `findModel` — its prefix fallback absorbs a trailing qualifier
+ * and answers with a neighbour, pricing `gpt-5.3-instant` as `gpt-5` and `claude-sonnet-5-free` as
+ * the paid model. Naming a real vendor is not evidence that the vendor sells this model.
+ *
+ * Gateway markup is not captured, so a marked-up router reads a few percent low. `costSource` marks
+ * these `estimated`, and being slightly low beats recording zero.
+ */
+function findModelByVendorPrefix({
+  modelId,
+  reportedProvider,
+  reportedProviderIsKnown,
+}: {
+  modelId: string
+  reportedProvider: string
+  reportedProviderIsKnown: boolean
+}): Model | undefined {
+  const separator = modelId.indexOf("/")
+  if (separator <= 0) return undefined
+
+  const vendor = resolveProviderName(modelId.slice(0, separator))
+  if (reportedProviderIsKnown && vendor !== reportedProvider) return undefined
+
+  const bareId = modelId.slice(separator + 1).toLowerCase()
+  return modelsForResolvedProvider(vendor).find((m) => m.id.toLowerCase() === bareId)
+}
+
+/**
+ * Find a specific model within a provider's model list.
+ *
+ * Every match that names a catalog entry outright is tried before the prefix fallback, which is the
+ * only one that can answer with a model the requested id does not name. Asking it first let it hijack
+ * ids the catalog spells exactly: `minimax-m2.5` on a provider listing `minimax/minimax-m2.5` came
+ * back as the neighbouring `MiniMax-M2`, at that older model's rate.
+ *
+ * For Bedrock models, tries the original model ID first (some models in
+ * models.dev include the regional prefix), then falls back to stripping
+ * the prefix (`eu.`, `us.`, `apac.`) for models that don't.
+ */
+export function getModelForProvider(provider: string, modelId: string): Model | undefined {
+  const resolvedProvider = resolveProviderName(provider)
+  const models = modelsForResolvedProvider(resolvedProvider)
+
+  if (resolvedProvider === "amazon-bedrock") {
+    const stripped = stripBedrockRegionPrefix(modelId)
+    return (
+      findModelExact(models, modelId) ??
+      findModelExact(models, stripped) ??
+      findBedrockModelByBareId(models, stripped) ??
+      findModelByPrefix(models, modelId) ??
+      findModelByPrefix(models, stripped)
+    )
+  }
+
+  return (
+    findModelExact(models, modelId) ??
+    findModelByBareId(models, modelId) ??
+    findModelByVendorPrefix({
+      modelId,
+      reportedProvider: resolvedProvider,
+      reportedProviderIsKnown: models.length > 0,
+    }) ??
+    findModelByPrefix(models, modelId)
+  )
+}
+
+/**
+ * Look up the per-1M-token cost specification for a provider/model pair.
+ *
+ * Returns `{ costImplemented: true, cost }` when pricing is available,
+ * or `{ costImplemented: false, cost: { input: 0, output: 0 } }` otherwise.
+ */
+export function getCostSpec(provider: string, modelId: string): CostLookupResult {
+  const NOT_IMPLEMENTED: CostLookupResult = {
+    cost: { input: 0, output: 0 },
+    costImplemented: false,
+    pricedProvider: "",
+    pricedModel: "",
+  }
+
+  try {
+    const model = getModelForProvider(provider, modelId)
+    if (!model) return NOT_IMPLEMENTED
+
+    const pricing = getModelPricing(model)
+    if (!pricing) return NOT_IMPLEMENTED
+
+    return {
+      cost: {
+        input: pricing.input,
+        output: pricing.output,
+        reasoning: pricing.reasoning,
+        cacheRead: pricing.cacheRead,
+        cacheWrite: pricing.cacheWrite,
+      },
+      costImplemented: true,
+      pricedProvider: model.provider,
+      pricedModel: model.id,
+    }
+  } catch {
+    return NOT_IMPLEMENTED
+  }
+}
+
+/**
+ * Estimate the total cost (in USD) for a provider/model and token usage.
+ */
+export function estimateCost(provider: string, modelId: string, usage: TokenUsage): number {
+  const { cost } = getCostSpec(provider, modelId)
+  return estimateTotalCost(cost, usage)
+}
+
+/**
+ * Produce a detailed cost breakdown for a provider/model and token usage.
+ */
+export function estimateCostWithBreakdown(provider: string, modelId: string, usage: TokenUsage): CostBreakdown {
+  const { cost } = getCostSpec(provider, modelId)
+  return computeCostBreakdown(cost, usage)
+}
+
+/**
+ * Build a `provider/model` key suitable for use as a cost-breakdown map key.
+ */
+export function costBreakdownKey(provider: string, modelId: string): string {
+  return `${provider}/${modelId}`
+}
+
+/**
+ * Format a model into a human-readable summary string.
+ *
+ * Includes name, modalities, features, context window, pricing,
+ * and knowledge cutoff when available.
+ */
+export function formatModel(model: Model): string {
+  const lines: string[] = [`${model.name} (${model.id})`]
+
+  if (model.modalities) {
+    const input = model.modalities.input?.join(", ")
+    const output = model.modalities.output?.join(", ")
+    if (input) lines.push(`Input modalities: ${input}`)
+    if (output) lines.push(`Output modalities: ${output}`)
+  }
+
+  const features: string[] = []
+  if (model.supportsTemperature) features.push("temperature")
+  else lines.push("Temperature not supported")
+  if (model.toolCall) features.push("tool calling")
+  if (model.reasoning) features.push("reasoning")
+  if (model.structuredOutput) features.push("structured output")
+  if (model.attachment) features.push("attachments")
+  if (features.length) lines.push(`Supported features: ${features.join(", ")}`)
+
+  if (model.contextLimit || model.outputLimit) {
+    const parts: string[] = []
+    if (model.contextLimit) parts.push(`input: ${formatCount(model.contextLimit)}`)
+    if (model.outputLimit) parts.push(`output: ${formatCount(model.outputLimit)}`)
+    if (parts.length) lines.push(`Context window: ${parts.join(", ")}`)
+  }
+
+  if (model.pricing) {
+    const parts: string[] = []
+    if (model.pricing.input !== undefined) parts.push(`input: ${formatPrice(model.pricing.input)}`)
+    if (model.pricing.output !== undefined) parts.push(`output: ${formatPrice(model.pricing.output)}`)
+    if (model.pricing.cacheRead !== undefined) parts.push(`cache read: ${formatPrice(model.pricing.cacheRead)}`)
+    if (model.pricing.cacheWrite !== undefined) parts.push(`cache write: ${formatPrice(model.pricing.cacheWrite)}`)
+    if (parts.length) lines.push(`Pricing (per 1M tokens): ${parts.join(", ")}`)
+  }
+
+  if (model.knowledgeCutoff) lines.push(`Knowledge cutoff: ${model.knowledgeCutoff}`)
+
+  return lines.join("\n")
+}
